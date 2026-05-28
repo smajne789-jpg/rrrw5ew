@@ -1,3 +1,8 @@
+# Telegram Raffle Bot (AIogram 3 + CryptoBot + SQLite)
+
+Полностью готовый Telegram-бот для розыгрышей с:
+
+* Созданием розыгрышей
 import asyncio
 import random
 import aiohttp
@@ -152,14 +157,18 @@ async def create_invoice(amount, payload="raffle"):
     data = {
         "asset": "USDT",
         "amount": str(amount),
-        "description": payload
+        "description": payload,
+        "paid_btn_name": "openBot",
+        "paid_btn_url": f"https://t.me/{BOT_USERNAME}"
     }
 
     async with aiohttp.ClientSession() as session:
         async with session.post(url, headers=headers, json=data) as response:
             result = await response.json()
 
-            if result["ok"]:
+            print(result)
+
+            if result.get("ok"):
                 return result["result"]
 
     return None
@@ -263,11 +272,34 @@ class AdminBalance(StatesGroup):
 # =========================
 
 @dp.message(Command("start"))
-async def start(message: Message):
+async def start(message: Message, state: FSMContext):
     await add_user(
         message.from_user.id,
         message.from_user.username or "none"
     )
+
+    args = message.text.split()
+
+    if len(args) > 1:
+
+        if args[1].startswith("raffle_"):
+
+            raffle_id = int(args[1].split("_")[1])
+
+            raffle = await get_active_raffle(raffle_id)
+
+            if not raffle:
+                return await message.answer("❌ Розыгрыш не найден")
+
+            await state.update_data(raffle_id=raffle_id)
+
+            await state.set_state(BuyTickets.amount)
+
+            return await message.answer(
+                f"🎟 Введите количество билетов\n\n"
+                f"1 билет = {TICKET_PRICE}$\n"
+                f"Минимум: {MIN_TICKETS}"
+            )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -475,19 +507,14 @@ async def admin_panel(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="🎁 Создать розыгрыш",
-                callback_data="create_raffle"
-            )
-        ]
-    ])
-
-    await message.answer(
-        "⚙️ Админ панель",
-        reply_markup=kb
+    text = (
+        "⚙️ Админ панель\n\n"
+        "🎁 /createraffle - создать розыгрыш\n"
+        "💰 /addbalance username сумма\n"
+        "❌ /removebalance username сумма"
     )
+
+    await message.answer(text)
 
 
 @dp.callback_query(F.data == "create_raffle")
