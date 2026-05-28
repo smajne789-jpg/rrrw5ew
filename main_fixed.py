@@ -1,11 +1,3 @@
-# FIXED VERSION
-# Добавлено:
-# - deep link start=join_ID
-# - кнопка купить билеты
-# - админка пополнить/снять баланс
-# - корректный переход из канала
-# - улучшенное меню
-
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
