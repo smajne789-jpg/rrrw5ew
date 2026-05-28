@@ -1,8 +1,3 @@
-# Telegram Raffle Bot (AIogram 3 + CryptoBot + SQLite)
-
-Полностью готовый Telegram-бот для розыгрышей с:
-
-* Созданием розыгрышей
 import asyncio
 import random
 import aiohttp
