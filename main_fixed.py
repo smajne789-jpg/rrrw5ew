@@ -1,250 +1,597 @@
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
-
 import asyncio
+import logging
+import random
+import time
+from datetime import datetime, timedelta
+from decimal import Decimal
+
+import aiohttp
 import aiosqlite
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from dotenv import load_dotenv
 import os
 
-BOT_TOKEN = "TOKEN"
-BOT_USERNAME = "your_bot"
+load_dotenv()
 
-bot = Bot(BOT_TOKEN)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+CRYPTOPAY_TOKEN = os.getenv("CRYPTOPAY_TOKEN")
+BOT_USERNAME = os.getenv("BOT_USERNAME")
+
+DB_NAME = "bot.db"
+TICKET_PRICE = Decimal("0.1")
+MIN_TICKETS = 5
+CRYPTO_API = "https://pay.crypt.bot/api"
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+
 dp = Dispatcher(storage=MemoryStorage())
 
-DB = "database.db"
 
-
-class BuyState(StatesGroup):
-    tickets = State()
-
-
-class AdminBalance(StatesGroup):
-    user = State()
+class TopupState(StatesGroup):
     amount = State()
 
 
-async def db():
-    conn = await aiosqlite.connect(DB)
-    return conn
+class WithdrawState(StatesGroup):
+    amount = State()
 
 
-async def create_tables():
-    conn = await db()
-
-    await conn.execute("""
-    CREATE TABLE IF NOT EXISTS users(
-        user_id INTEGER PRIMARY KEY,
-        balance REAL DEFAULT 0
-    )
-    """)
-
-    await conn.commit()
-    await conn.close()
+class GiveawayState(StatesGroup):
+    prize = State()
+    duration = State()
 
 
-menu = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [InlineKeyboardButton(text="🎟 Купить билеты", callback_data="buy_menu")],
-        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")]
-    ]
-)
+class BuyTicketsState(StatesGroup):
+    amount = State()
+
+
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            balance REAL DEFAULT 0,
+            created_at TEXT
+        )
+        ''')
+
+        await db.execute('''
+        CREATE TABLE IF NOT EXISTS giveaways (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prize REAL,
+            total_bank REAL,
+            end_time INTEGER,
+            active INTEGER DEFAULT 1,
+            message_id INTEGER
+        )
+        ''')
+
+        await db.execute('''
+        CREATE TABLE IF NOT EXISTS tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            giveaway_id INTEGER,
+            user_id INTEGER,
+            ticket_number INTEGER
+        )
+        ''')
+
+        await db.execute('''
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            invoice_id TEXT,
+            amount REAL,
+            status TEXT
+        )
+        ''')
+
+        await db.execute('''
+        CREATE TABLE IF NOT EXISTS withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            status TEXT
+        )
+        ''')
+
+        await db.commit()
+
+
+async def register_user(user):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT user_id FROM users WHERE user_id=?",
+            (user.id,)
+        )
+        exists = await cursor.fetchone()
+
+        if not exists:
+            await db.execute(
+                "INSERT INTO users VALUES (?, ?, ?, ?)",
+                (
+                    user.id,
+                    user.username,
+                    0,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
+            )
+            await db.commit()
+
+
+async def get_balance(user_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT balance FROM users WHERE user_id=?",
+            (user_id,)
+        )
+        row = await cursor.fetchone()
+        return float(row[0]) if row else 0
+
+
+async def update_balance(user_id, amount):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE users SET balance = balance + ? WHERE user_id=?",
+            (amount, user_id)
+        )
+        await db.commit()
+
+
+async def create_invoice(amount):
+    headers = {
+        "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN
+    }
+
+    payload = {
+        "asset": "USDT",
+        "amount": str(amount)
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{CRYPTO_API}/createInvoice",
+            headers=headers,
+            json=payload
+        ) as response:
+            data = await response.json()
+            return data
+
+
+async def check_invoice(invoice_id):
+    headers = {
+        "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{CRYPTO_API}/getInvoices?invoice_ids={invoice_id}",
+            headers=headers
+        ) as response:
+            data = await response.json()
+            return data
+
+
+async def main_menu():
+    kb = InlineKeyboardBuilder()
+
+    kb.button(text="🎟 Розыгрыши", callback_data="giveaways")
+    kb.button(text="👤 Профиль", callback_data="profile")
+    kb.button(text="💰 Баланс", callback_data="balance")
+    kb.button(text="➕ Пополнить", callback_data="topup")
+    kb.button(text="💸 Вывести", callback_data="withdraw")
+
+    kb.adjust(2)
+    return kb.as_markup()
 
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    args = message.text.split()
+    await register_user(message.from_user)
 
-    conn = await db()
+    text = """
+<b>🎁 Giveaway Bot</b>
 
-    await conn.execute(
-        "INSERT OR IGNORE INTO users(user_id) VALUES(?)",
-        (message.from_user.id,)
-    )
+Добро пожаловать в бота розыгрышей.
 
-    await conn.commit()
-    await conn.close()
+Покупайте билеты и выигрывайте большие призы.
+"""
 
-    # ВАЖНО! FIX deep link
-    if len(args) > 1:
-        param = args[1]
-
-        if param.startswith("join_"):
-            giveaway_id = param.split("_")[1]
-
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="🎟 Купить билеты",
-                            callback_data=f"buy_{giveaway_id}"
-                        )
-                    ]
-                ]
-            )
-
-            await message.answer(
-                f"🎁 Розыгрыш #{giveaway_id}\n\n"
-                f"Нажмите кнопку ниже чтобы участвовать",
-                reply_markup=kb
-            )
-
-            return
-
-    await message.answer(
-        "🎉 Добро пожаловать",
-        reply_markup=menu
-    )
-
-
-@dp.callback_query(F.data == "buy_menu")
-async def buy_menu(callback: CallbackQuery):
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎟 Купить билеты",
-                    callback_data="buy_1"
-                )
-            ]
-        ]
-    )
-
-    await callback.message.answer(
-        "🎁 Активный розыгрыш",
-        reply_markup=kb
-    )
-
-
-@dp.callback_query(F.data.startswith("buy_"))
-async def buy(callback: CallbackQuery, state: FSMContext):
-    giveaway_id = callback.data.split("_")[1]
-
-    await state.update_data(giveaway_id=giveaway_id)
-    await state.set_state(BuyState.tickets)
-
-    await callback.message.answer(
-        "Введите количество билетов"
-    )
-
-
-@dp.message(BuyState.tickets)
-async def process_buy(message: Message, state: FSMContext):
-    amount = int(message.text)
-
-    tickets = []
-
-    for i in range(amount):
-        tickets.append(str(i + 1))
-
-    await message.answer(
-        "✅ Билеты куплены\n\n"
-        f"🎟 Ваши номера:\n{', '.join(tickets)}"
-    )
-
-    await state.clear()
+    await message.answer(text, reply_markup=await main_menu())
 
 
 @dp.callback_query(F.data == "profile")
 async def profile(callback: CallbackQuery):
-    conn = await db()
+    balance = await get_balance(callback.from_user.id)
 
-    cur = await conn.execute(
-        "SELECT balance FROM users WHERE user_id=?",
-        (callback.from_user.id,)
+    text = f"""
+<b>👤 Ваш профиль</b>
+
+🆔 ID: <code>{callback.from_user.id}</code>
+👤 Username: @{callback.from_user.username}
+💰 Баланс: <b>{balance}$</b>
+"""
+
+    await callback.message.edit_text(text, reply_markup=await main_menu())
+
+
+@dp.callback_query(F.data == "balance")
+async def balance(callback: CallbackQuery):
+    bal = await get_balance(callback.from_user.id)
+
+    await callback.answer(
+        f"Ваш баланс: {bal}$",
+        show_alert=True
     )
 
-    row = await cur.fetchone()
 
-    balance = row[0]
-
-    await conn.close()
+@dp.callback_query(F.data == "topup")
+async def topup(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(TopupState.amount)
 
     await callback.message.answer(
-        f"👤 Профиль\n\n"
-        f"💰 Баланс: {balance}$"
+        "💰 Введите сумму пополнения\n\nМинимум: 0.1$"
     )
 
 
-# ADMIN
-@dp.message(Command("admin"))
-async def admin(message: Message):
+@dp.message(TopupState.amount)
+async def topup_amount(message: Message, state: FSMContext):
+    try:
+        amount = Decimal(message.text)
+
+        if amount < Decimal("0.1"):
+            return await message.answer("❌ Минимум 0.1$")
+
+        invoice = await create_invoice(amount)
+
+        if not invoice.get("ok"):
+            return await message.answer("❌ Ошибка создания счета")
+
+        invoice_data = invoice["result"]
+
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                "INSERT INTO payments (user_id, invoice_id, amount, status) VALUES (?, ?, ?, ?)",
+                (
+                    message.from_user.id,
+                    invoice_data["invoice_id"],
+                    float(amount),
+                    "pending"
+                )
+            )
+            await db.commit()
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="💳 Оплатить",
+                        url=invoice_data["pay_url"]
+                    )
+                ]
+            ]
+        )
+
+        await message.answer(
+            f"💰 Счет на {amount}$ создан",
+            reply_markup=kb
+        )
+
+        asyncio.create_task(
+            wait_payment(
+                message.from_user.id,
+                invoice_data["invoice_id"],
+                amount,
+                message.chat.id
+            )
+        )
+
+        await state.clear()
+
+    except Exception as e:
+        logging.error(e)
+        await message.answer("❌ Ошибка")
+
+
+async def wait_payment(user_id, invoice_id, amount, chat_id):
+    for _ in range(120):
+        try:
+            data = await check_invoice(invoice_id)
+
+            if data["ok"]:
+                items = data["result"]["items"]
+
+                if items:
+                    invoice = items[0]
+
+                    if invoice["status"] == "paid":
+                        async with aiosqlite.connect(DB_NAME) as db:
+                            cursor = await db.execute(
+                                "SELECT status FROM payments WHERE invoice_id=?",
+                                (str(invoice_id),)
+                            )
+                            row = await cursor.fetchone()
+
+                            if row and row[0] == "paid":
+                                return
+
+                            await db.execute(
+                                "UPDATE payments SET status='paid' WHERE invoice_id=?",
+                                (str(invoice_id),)
+                            )
+
+                            await db.commit()
+
+                        await update_balance(user_id, float(amount))
+
+                        await bot.send_message(
+                            chat_id,
+                            f"✅ Баланс пополнен на {amount}$"
+                        )
+
+                        return
+
+        except Exception as e:
+            logging.error(e)
+
+        await asyncio.sleep(5)
+
+
+@dp.callback_query(F.data == "withdraw")
+async def withdraw(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(WithdrawState.amount)
+
+    await callback.message.answer(
+        "💸 Введите сумму вывода"
+    )
+
+
+@dp.message(WithdrawState.amount)
+async def withdraw_amount(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+        balance = await get_balance(message.from_user.id)
+
+        if amount > balance:
+            return await message.answer("❌ Недостаточно средств")
+
+        async with aiosqlite.connect(DB_NAME) as db:
+            cursor = await db.execute(
+                "INSERT INTO withdrawals (user_id, amount, status) VALUES (?, ?, ?)",
+                (
+                    message.from_user.id,
+                    amount,
+                    "pending"
+                )
+            )
+            await db.commit()
+
+            withdrawal_id = cursor.lastrowid
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Подтвердить",
+                        callback_data=f"approve_withdraw:{withdrawal_id}:{message.from_user.id}:{amount}"
+                    )
+                ]
+            ]
+        )
+
+        await bot.send_message(
+            ADMIN_ID,
+            f"💸 Заявка на вывод\n\n"
+            f"👤 @{message.from_user.username}\n"
+            f"🆔 {message.from_user.id}\n"
+            f"💰 {amount}$",
+            reply_markup=kb
+        )
+
+        await message.answer("✅ Заявка отправлена")
+        await state.clear()
+
+    except Exception as e:
+        logging.error(e)
+        await message.answer("❌ Ошибка")
+
+
+@dp.callback_query(F.data.startswith("approve_withdraw"))
+async def approve_withdraw(callback: CallbackQuery):
+    try:
+        _, wid, user_id, amount = callback.data.split(":")
+
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                "UPDATE withdrawals SET status='done' WHERE id=?",
+                (wid,)
+            )
+
+            await db.execute(
+                "UPDATE users SET balance = balance - ? WHERE user_id=?",
+                (float(amount), int(user_id))
+            )
+
+            await db.commit()
+
+        await bot.send_message(
+            int(user_id),
+            "✅ Ваш вывод успешно обработан"
+        )
+
+        await callback.answer("Подтверждено")
+
+    except Exception as e:
+        logging.error(e)
+
+
+@dp.message(F.text == "/admin")
+async def admin_panel(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎁 Создать розыгрыш", callback_data="create_giveaway")]
+        ]
+    )
+
+    await message.answer("⚙ Админ панель", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "create_giveaway")
+async def create_giveaway(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    await state.set_state(GiveawayState.prize)
+    await callback.message.answer("Введите сумму приза")
+
+
+@dp.message(GiveawayState.prize)
+async def giveaway_prize(message: Message, state: FSMContext):
+    await state.update_data(prize=float(message.text))
+    await state.set_state(GiveawayState.duration)
+
+    await message.answer(
+        "Введите длительность в минутах"
+    )
+
+
+@dp.message(GiveawayState.duration)
+async def giveaway_duration(message: Message, state: FSMContext):
+    data = await state.get_data()
+
+    minutes = int(message.text)
+    end_time = int(time.time()) + (minutes * 60)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "INSERT INTO giveaways (prize, total_bank, end_time) VALUES (?, ?, ?)",
+            (
+                data['prize'],
+                data['prize'],
+                end_time
+            )
+        )
+        await db.commit()
+
+        giveaway_id = cursor.lastrowid
+
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="➕ Пополнить баланс",
-                    callback_data="add_balance"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="➖ Снять баланс",
-                    callback_data="remove_balance"
+                    text="🎟 Участвовать",
+                    url=f"https://t.me/{BOT_USERNAME}?start=gw_{giveaway_id}"
                 )
             ]
         ]
     )
 
-    await message.answer(
-        "⚙️ Админ панель",
+    msg = await bot.send_message(
+        CHANNEL_ID,
+        f"🎁 <b>Новый розыгрыш</b>\n\n"
+        f"💰 Приз: {data['prize']}$\n"
+        f"🎟 Цена билета: 0.1$\n"
+        f"⏳ До конца: {minutes} мин",
         reply_markup=kb
     )
 
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE giveaways SET message_id=? WHERE id=?",
+            (msg.message_id, giveaway_id)
+        )
+        await db.commit()
 
-@dp.callback_query(F.data == "add_balance")
-async def add_balance_start(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminBalance.user)
-
-    await callback.message.answer(
-        "Введите ID пользователя"
-    )
-
-
-@dp.message(AdminBalance.user)
-async def admin_user(message: Message, state: FSMContext):
-    await state.update_data(user_id=message.text)
-    await state.set_state(AdminBalance.amount)
-
-    await message.answer(
-        "Введите сумму"
-    )
-
-
-@dp.message(AdminBalance.amount)
-async def admin_amount(message: Message, state: FSMContext):
-    data = await state.get_data()
-
-    user_id = int(data["user_id"])
-    amount = float(message.text)
-
-    conn = await db()
-
-    await conn.execute(
-        "UPDATE users SET balance = balance + ? WHERE user_id=?",
-        (amount, user_id)
-    )
-
-    await conn.commit()
-    await conn.close()
-
-    await message.answer(
-        "✅ Баланс изменен"
-    )
-
-    await bot.send_message(
-        user_id,
-        f"💰 Вам начислено {amount}$"
-    )
-
+    await message.answer("✅ Розыгрыш создан")
     await state.clear()
 
 
+async def giveaway_checker():
+    while True:
+        try:
+            now = int(time.time())
+
+            async with aiosqlite.connect(DB_NAME) as db:
+                cursor = await db.execute(
+                    "SELECT id, total_bank FROM giveaways WHERE active=1 AND end_time<=?",
+                    (now,)
+                )
+
+                giveaways = await cursor.fetchall()
+
+                for giveaway in giveaways:
+                    gid = giveaway[0]
+                    bank = giveaway[1]
+
+                    cursor2 = await db.execute(
+                        "SELECT user_id, ticket_number FROM tickets WHERE giveaway_id=?",
+                        (gid,)
+                    )
+
+                    tickets = await cursor2.fetchall()
+
+                    if not tickets:
+                        continue
+
+                    winner = random.choice(tickets)
+
+                    user_id = winner[0]
+                    ticket = winner[1]
+
+                    await db.execute(
+                        "UPDATE giveaways SET active=0 WHERE id=?",
+                        (gid,)
+                    )
+
+                    await db.commit()
+
+                    try:
+                        user = await bot.get_chat(user_id)
+                        username = user.username or user.first_name
+                    except:
+                        username = "Unknown"
+
+                    await bot.send_message(
+                        CHANNEL_ID,
+                        f"🎉 <b>Розыгрыш завершен</b>\n\n"
+                        f"🏆 Победитель: @{username}\n"
+                        f"🎟 Билет: {ticket}\n"
+                        f"💰 Выигрыш: {bank}$"
+                    )
+
+        except Exception as e:
+            logging.error(e)
+
+        await asyncio.sleep(10)
+
+
 async def main():
-    await create_tables()
+    await init_db()
+
+    asyncio.create_task(giveaway_checker())
+
     await dp.start_polling(bot)
 
 
