@@ -64,6 +64,12 @@ class BuyTicketsState(StatesGroup):
     amount = State()
 
 
+class AdminBalanceState(StatesGroup):
+    username = State()
+    amount = State()
+    action = State()
+
+
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute('''
@@ -159,12 +165,16 @@ async def update_balance(user_id, amount):
 
 async def create_invoice(amount):
     headers = {
-        "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN
+        "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN,
+        "Content-Type": "application/json"
     }
 
     payload = {
         "asset": "USDT",
-        "amount": str(amount)
+        "amount": str(amount),
+        "description": "Balance top up",
+        "paid_btn_name": "openBot",
+        "paid_btn_url": f"https://t.me/{BOT_USERNAME}"
     }
 
     async with aiohttp.ClientSession() as session:
@@ -173,7 +183,9 @@ async def create_invoice(amount):
             headers=headers,
             json=payload
         ) as response:
-            data = await response.json()
+            text = await response.text()
+            logging.info(f"CREATE INVOICE RESPONSE: {text}")
+            data = await response.json(content_type=None)
             return data
 
 
@@ -184,10 +196,13 @@ async def check_invoice(invoice_id):
 
     async with aiohttp.ClientSession() as session:
         async with session.get(
-            f"{CRYPTO_API}/getInvoices?invoice_ids={invoice_id}",
-            headers=headers
+            f"{CRYPTO_API}/getInvoices",
+            headers=headers,
+            params={"invoice_ids": invoice_id}
         ) as response:
-            data = await response.json()
+            text = await response.text()
+            logging.info(f"CHECK INVOICE RESPONSE: {text}")
+            data = await response.json(content_type=None)
             return data
 
 
@@ -308,8 +323,8 @@ async def topup_amount(message: Message, state: FSMContext):
         await state.clear()
 
     except Exception as e:
-        logging.error(e)
-        await message.answer("❌ Ошибка")
+        logging.exception(e)
+        await message.answer(f"❌ Ошибка: {str(e)}")
 
 
 async def wait_payment(user_id, invoice_id, amount, chat_id):
@@ -411,8 +426,8 @@ async def withdraw_amount(message: Message, state: FSMContext):
         await state.clear()
 
     except Exception as e:
-        logging.error(e)
-        await message.answer("❌ Ошибка")
+        logging.exception(e)
+        await message.answer(f"❌ Ошибка: {str(e)}")
 
 
 @dp.callback_query(F.data.startswith("approve_withdraw"))
@@ -451,11 +466,72 @@ async def admin_panel(message: Message):
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🎁 Создать розыгрыш", callback_data="create_giveaway")]
+            [InlineKeyboardButton(text="🎁 Создать розыгрыш", callback_data="create_giveaway")],
+            [InlineKeyboardButton(text="💳 Выдать баланс", callback_data="add_balance")],
+            [InlineKeyboardButton(text="❌ Снять баланс", callback_data="remove_balance")]
         ]
     )
 
     await message.answer("⚙ Админ панель", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "add_balance")
+async def add_balance_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminBalanceState.username)
+    await state.update_data(action="add")
+    await callback.message.answer("Введите username пользователя без @")
+
+
+@dp.callback_query(F.data == "remove_balance")
+async def remove_balance_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminBalanceState.username)
+    await state.update_data(action="remove")
+    await callback.message.answer("Введите username пользователя без @")
+
+
+@dp.message(AdminBalanceState.username)
+async def admin_balance_username(message: Message, state: FSMContext):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT user_id FROM users WHERE username=?",
+            (message.text.replace('@', ''),)
+        )
+        user = await cursor.fetchone()
+
+    if not user:
+        return await message.answer("❌ Пользователь не найден")
+
+    await state.update_data(target_id=user[0])
+    await state.set_state(AdminBalanceState.amount)
+    await message.answer("Введите сумму")
+
+
+@dp.message(AdminBalanceState.amount)
+async def admin_balance_amount(message: Message, state: FSMContext):
+    data = await state.get_data()
+
+    amount = float(message.text)
+    target_id = data['target_id']
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        if data['action'] == 'add':
+            await db.execute(
+                "UPDATE users SET balance = balance + ? WHERE user_id=?",
+                (amount, target_id)
+            )
+            text = f"✅ Баланс пополнен на {amount}$"
+        else:
+            await db.execute(
+                "UPDATE users SET balance = balance - ? WHERE user_id=?",
+                (amount, target_id)
+            )
+            text = f"❌ С баланса списано {amount}$"
+
+        await db.commit()
+
+    await bot.send_message(target_id, text)
+    await message.answer("✅ Успешно")
+    await state.clear()
 
 
 @dp.callback_query(F.data == "create_giveaway")
