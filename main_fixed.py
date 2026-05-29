@@ -555,53 +555,82 @@ async def giveaway_prize(message: Message, state: FSMContext):
 
 @dp.message(GiveawayState.duration)
 async def giveaway_duration(message: Message, state: FSMContext):
-    data = await state.get_data()
+    try:
+        data = await state.get_data()
 
-    minutes = int(message.text)
-    end_time = int(time.time()) + (minutes * 60)
+        minutes = int(message.text)
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute(
-            "INSERT INTO giveaways (prize, total_bank, end_time) VALUES (?, ?, ?)",
-            (
-                data['prize'],
-                data['prize'],
-                end_time
-            )
-        )
-        await db.commit()
+        if minutes <= 0:
+            return await message.answer("❌ Введите корректное количество минут")
 
-        giveaway_id = cursor.lastrowid
+        end_time = int(time.time()) + (minutes * 60)
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎟 Участвовать",
-                    url=f"https://t.me/{BOT_USERNAME}?start=gw_{giveaway_id}"
+        async with aiosqlite.connect(DB_NAME) as db:
+            cursor = await db.execute(
+                "INSERT INTO giveaways (prize, total_bank, end_time, active) VALUES (?, ?, ?, ?)",
+                (
+                    float(data['prize']),
+                    float(data['prize']),
+                    end_time,
+                    1
                 )
+            )
+
+            await db.commit()
+            giveaway_id = cursor.lastrowid
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🎟 Участвовать",
+                        url=f"https://t.me/{BOT_USERNAME}?start=gw_{giveaway_id}"
+                    )
+                ]
             ]
-        ]
-    )
-
-    msg = await bot.send_message(
-        CHANNEL_ID,
-        f"🎁 <b>Новый розыгрыш</b>\n\n"
-        f"💰 Приз: {data['prize']}$\n"
-        f"🎟 Цена билета: 0.1$\n"
-        f"⏳ До конца: {minutes} мин",
-        reply_markup=kb
-    )
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "UPDATE giveaways SET message_id=? WHERE id=?",
-            (msg.message_id, giveaway_id)
         )
-        await db.commit()
 
-    await message.answer("✅ Розыгрыш создан")
-    await state.clear()
+        text = (
+            f"🎁 <b>НОВЫЙ РОЗЫГРЫШ</b>
+
+"
+            f"💰 Начальный приз: <b>{data['prize']}$</b>
+"
+            f"🎟 Цена билета: <b>0.1$</b>
+"
+            f"📈 Все деньги с билетов идут в призовой фонд
+"
+            f"⏳ Длительность: <b>{minutes} мин.</b>
+
+"
+            f"🔥 Участвуй прямо сейчас!"
+        )
+
+        msg = await bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=text,
+            reply_markup=kb
+        )
+
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(
+                "UPDATE giveaways SET message_id=? WHERE id=?",
+                (msg.message_id, giveaway_id)
+            )
+            await db.commit()
+
+        await message.answer(
+            f"✅ Розыгрыш успешно создан
+
+ID: {giveaway_id}"
+        )
+
+        await state.clear()
+
+    except Exception as e:
+        logging.exception(e)
+        await message.answer(f"❌ Ошибка создания розыгрыша:
+{str(e)}")
 
 
 async def giveaway_checker():
