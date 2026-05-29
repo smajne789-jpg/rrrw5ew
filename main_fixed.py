@@ -589,23 +589,14 @@ async def giveaway_duration(message: Message, state: FSMContext):
                 ]
             ]
         )
-
-        text = (
-            f"🎁 <b>НОВЫЙ РОЗЫГРЫШ</b>
-
-"
-            f"💰 Начальный приз: <b>{data['prize']}$</b>
-"
-            f"🎟 Цена билета: <b>0.1$</b>
-"
-            f"📈 Все деньги с билетов идут в призовой фонд
-"
-            f"⏳ Длительность: <b>{minutes} мин.</b>
-
-"
-            f"🔥 Участвуй прямо сейчас!"
-        )
-
+text = (
+    f"🎁 <b>НОВЫЙ РОЗЫГРЫШ</b>\n\n"
+    f"💰 Начальный приз: <b>{data['prize']}$</b>\n"
+    f"🎟 Цена билета: <b>0.1$</b>\n"
+    f"📈 Все деньги с билетов идут в призовой фонд\n"
+    f"⏳ Длительность: <b>{minutes} мин.</b>\n\n"
+    f"🔥 Участвуй прямо сейчас!"
+)
         msg = await bot.send_message(
             chat_id=CHANNEL_ID,
             text=text,
